@@ -21,7 +21,8 @@ class ApiError(Exception):
 
 
 def not_found(what="job"):
-    return ApiError(404, "not_found", f"No such {what}. Check the id from GET /v1/jobs.")
+    where = "GET /v1/jobs" if what == "job" else "the link you were sent"
+    return ApiError(404, "not_found", f"No such {what}. Check the id from {where}.")
 
 
 def invalid_state(state, wanted):
@@ -151,3 +152,85 @@ def rate_limited():
 
 def bad_request(detail, field=None):
     return ApiError(400, "bad_request", f"{detail} Nothing was stored.", field=field)
+
+
+# -- operator consent ---------------------------------------------------------
+#
+# `no_demand_yet` and `demand_unavailable` are both deliberately hard failures
+# rather than a page rendered without figures. A consent page with no payer on
+# it proves in one screen that there is nobody paying, and asking for a
+# signature anyway is the exact failure the consent spec exists to prevent.
+
+NO_DEMAND_SENTENCE = "No jobs have been paid yet."
+
+
+def no_demand_yet():
+    return ApiError(
+        409,
+        "no_demand_yet",
+        f"{NO_DEMAND_SENTENCE} There is no consent page to show and no "
+        "signature to take until the queue has settled one. Post a job, have "
+        "it delivered and accepted, and this page will carry the receipt.",
+    )
+
+
+def demand_unavailable():
+    return ApiError(
+        503,
+        "demand_unavailable",
+        "The work queue could not be read, so the demand figures on this page "
+        "would be missing or stale. Nothing was rendered and nothing changed. "
+        "Retry once GET /v1/health is ok.",
+    )
+
+
+def invalid_consent_state(state):
+    return ApiError(
+        409,
+        "invalid_state",
+        f"This consent is {state!r}; only a 'pending' consent can be signed "
+        "or declined. Nothing changed. A changed scope is a new page and a "
+        "new signature.",
+    )
+
+
+def invalid_signer(maximum):
+    return ApiError(
+        400,
+        "invalid_signer",
+        f"signed_by must be the signer's name, 1..{maximum} characters. "
+        "Nothing was stored.",
+        field="signed_by",
+    )
+
+
+def reason_required_for_decline():
+    return ApiError(
+        400,
+        "reason_required",
+        "A decline must carry a reason. Nothing changed. The reason is the "
+        "single most useful thing this page collects, which is why it is not "
+        "optional.",
+        field="reason",
+    )
+
+
+def scope_conflict():
+    return ApiError(
+        400,
+        "scope_conflict",
+        "A receive_only consent cannot carry max_send_xno: it grants no send "
+        "authority at all, so a ceiling on it would be meaningless. Nothing "
+        "was stored. Use scope 'receive_and_send' if a send limit is meant.",
+        field="max_send_xno",
+    )
+
+
+def expiry_not_settable():
+    return ApiError(
+        400,
+        "expiry_not_settable",
+        "expires_at is computed server-side as 90 days from creation and "
+        "cannot be supplied. Nothing was stored. Resend without it.",
+        field="expires_at",
+    )

@@ -13,13 +13,20 @@ import json
 import os
 import sys
 import threading
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from nano_work_queue.clock import FakeClock            # noqa: E402
+from nano_work_queue.consent import (                  # noqa: E402
+    ConsentService, DemandSource, DemandUnavailable,
+)
+from nano_work_queue.conversations import MemoryConversationStore  # noqa: E402
 from nano_work_queue.http_app import RateLimiter, make_handler   # noqa: E402
 from nano_work_queue.mcp_server import FIRST_SENTENCE, tool_list  # noqa: E402
 from nano_work_queue.node import FakeNode              # noqa: E402
@@ -63,17 +70,27 @@ class Client:
             return e.code, (json.loads(raw) if raw[:1] == "{" else raw)
 
 
-def boot(balance="1000", confirms=True):
+def boot(balance="1000", confirms=True, with_consent=False):
     clock = FakeClock()
     node = FakeNode(balance_xno=balance, confirms=confirms)
     port_holder = {}
     service = Service(node, clock=clock, base_url="http://127.0.0.1")
+    consents = walls = None
+    if with_consent:
+        walls = MemoryConversationStore()
+        consents = ConsentService(DemandSource(service), clock,
+                                  base_url="http://127.0.0.1",
+                                  conversation_store=walls)
     handler = make_handler(service, buyer_token_getter=lambda: BUYER,
-                           rate_limiter=RateLimiter(clock, limit=1000))
+                           rate_limiter=RateLimiter(clock, limit=1000),
+                           consents=consents)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     port_holder["port"] = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     service.base_url = f"http://127.0.0.1:{port_holder['port']}"
+    if consents is not None:
+        consents.base_url = service.base_url
+        return service, node, clock, httpd, Client(service.base_url), consents, walls
     return service, node, clock, httpd, Client(service.base_url)
 
 
@@ -344,6 +361,8 @@ def main():
         httpd.shutdown()
         httpd.server_close()
 
+    consent_page_checks()
+
     print("\n" + "=" * 70)
     if FAILURES:
         print(f"{len(FAILURES)} of {CHECKS} CHECKS FAILED:")
@@ -352,6 +371,276 @@ def main():
         return 1
     print(f"ALL {CHECKS} END-TO-END CHECKS PASSED")
     return 0
+
+
+class Page(HTMLParser):
+    """Enough parsing to count what the consent spec forbids."""
+
+    def __init__(self):
+        super().__init__()
+        self.inputs, self.buttons, self.forms, self.links = [], [], 0, []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            self.forms += 1
+        elif tag == "input":
+            self.inputs.append(attrs)
+        elif tag == "button":
+            self.buttons.append(attrs)
+        elif tag == "a" and attrs.get("href"):
+            self.links.append(attrs["href"])
+
+
+def parse_page(html):
+    p = Page()
+    p.feed(html)
+    return p
+
+
+def raw_get(base, path, accept=None):
+    r = urllib.request.Request(base + path)
+    if accept:
+        r.add_header("Accept", accept)
+    try:
+        with urllib.request.urlopen(r, timeout=15) as resp:
+            return resp.status, resp.read().decode(), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(), dict(e.headers)
+
+
+def form_post(base, path, fields, accept=None):
+    data = urllib.parse.urlencode(fields).encode()
+    r = urllib.request.Request(base + path, data=data, method="POST")
+    r.add_header("Content-Type", "application/x-www-form-urlencoded")
+    if accept:
+        r.add_header("Accept", accept)
+    try:
+        with urllib.request.urlopen(r, timeout=15) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def settle_one(service, call, price="0.05"):
+    """post -> claim -> deliver -> accept -> settle, all over HTTP."""
+    job = call("POST", "/v1/jobs", dict(JOB, price_xno=price),
+               {"X-Buyer-Token": BUYER})[1]
+    claim = call("POST", f"/v1/jobs/{job['id']}/claim",
+                 {"seller": "arion", "payout_address": GOOD})[1]
+    call("POST", f"/v1/jobs/{job['id']}/deliver",
+         {"payload": [{"vendor": "a", "monthly": 10}]},
+         {"Authorization": f"Bearer {claim['claim_token']}"})
+    call("POST", f"/v1/jobs/{job['id']}/accept", None,
+         {"X-Buyer-Token": BUYER})
+    SettlementWorker(service).run_all()
+    return job["id"]
+
+
+def consent_page_checks():
+    """The 13 numbered tests from the operator-consent spec, over real HTTP."""
+    print("\n" + "=" * 70)
+    print("OPERATOR CONSENT PAGE -- the 13 numbered spec tests, over HTTP")
+
+    # ---- 1: zero settled jobs renders no form (the Pattern 6 test) -------
+    service, node, clock, httpd, call, consents, walls = boot(with_consent=True)
+    base = service.base_url
+    try:
+        csn = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                   {"X-Buyer-Token": BUYER})[1]["consent_id"]
+        print("\n1. test_zero_settled_jobs_renders_no_form")
+        status, html, _ = raw_get(base, f"/v1/consent/{csn}")
+        parsed = parse_page(html)
+        check("zero settled -> status", status, 409)
+        check("the page says it in those words",
+              "No jobs have been paid yet." in html, True)
+        check("no <form on the page", parsed.forms, 0)
+        check("no <input on the page", parsed.inputs, [])
+        check("no <button on the page", parsed.buttons, [])
+        check("a signature is refused too",
+              call("POST", f"/v1/consent/{csn}/sign",
+                   {"signed_by": "R", "decision": "approve"})[1]["error"],
+              "no_demand_yet")
+
+        # ---- 2: demand figures are live, not cached ----------------------
+        print("\n2. test_demand_figures_are_live_not_cached")
+        first_job = settle_one(service, call, "0.05")
+        status, html, headers = raw_get(base, f"/v1/consent/{csn}")
+        check("one settled job -> the page renders", status, 200)
+        check("the figures are the queue's own",
+              "1 jobs settled, 0.050000 XNO paid." in html, True)
+        settle_one(service, call, "0.10")
+        html2 = raw_get(base, f"/v1/consent/{csn}")[1]
+        check("settling another moves the page",
+              "2 jobs settled, 0.150000 XNO paid." in html2, True)
+        check("the stale figure is gone", "1 jobs settled" in html2, False)
+        check("the page is never cached", headers.get("Cache-Control"),
+              "no-store")
+
+        # ---- 3 / 4: scope ------------------------------------------------
+        print("\n3. test_default_scope_is_receive_only")
+        created = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                       {"X-Buyer-Token": BUYER})[1]
+        check("default scope", created["scope"], "receive_only")
+        check("no send ceiling", created["max_send_xno"], None)
+        check("the page says it cannot send",
+              "It cannot send." in raw_get(base,
+                                           f"/v1/consent/{created['consent_id']}")[1],
+              True)
+
+        print("\n4. test_receive_only_cannot_carry_a_send_limit")
+        status, body = call("POST", "/v1/consent",
+                            {"agent": "DeskCrew", "scope": "receive_only",
+                             "max_send_xno": "1.0"},
+                            {"X-Buyer-Token": BUYER})
+        check("receive_only + max_send_xno", (status, body["error"]),
+              (400, "scope_conflict"))
+
+        # ---- 5: the form -------------------------------------------------
+        print("\n5. test_form_has_exactly_two_inputs")
+        page_html = raw_get(base, f"/v1/consent/{csn}")[1]
+        parsed = parse_page(page_html)
+        check("exactly one form", parsed.forms, 1)
+        check("exactly two inputs, named", sorted(i["name"] for i in parsed.inputs),
+              ["reason", "signed_by"])
+        check("exactly two buttons, carrying the decision",
+              sorted(b["value"] for b in parsed.buttons),
+              ["approve", "decline"])
+        banned = ("email", "password", "card", "account", "address", "tel")
+        check("no forbidden field, no hidden field",
+              [i for i in parsed.inputs
+               if i.get("type") == "hidden"
+               or any(b in (i.get("name") or "").lower() for b in banned)],
+              [])
+
+        # ---- 6: no JavaScript --------------------------------------------
+        print("\n6. test_page_renders_without_javascript")
+        stripped = re.sub(r"<script.*?</script>", "", page_html, flags=re.S | re.I)
+        check("there is no script to strip", stripped == page_html, True)
+        for needed in ("jobs settled", "It cannot send.", "No custody.",
+                       "<form", "signed_by"):
+            check(f"still present without JS: {needed!r}",
+                  needed in stripped, True)
+
+        # ---- 7: expiry ---------------------------------------------------
+        print("\n7. test_expiry_is_ninety_days_and_not_settable")
+        status, body = call("POST", "/v1/consent",
+                            {"agent": "DeskCrew",
+                             "expires_at": "2099-01-01T00:00:00Z"},
+                            {"X-Buyer-Token": BUYER})
+        check("caller-supplied expiry", (status, body["error"]),
+              (400, "expiry_not_settable"))
+        detail = call("GET", f"/v1/consent/{csn}.json")[1]
+        check("expiry is 90 days after creation",
+              detail["expires_at"],
+              clock.iso(clock.now() + 90 * 86400))
+
+        # ---- 8 / 9: decline ------------------------------------------------
+        print("\n8. test_decline_is_recorded_as_evidence")
+        decl = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                    {"X-Buyer-Token": BUYER})[1]["consent_id"]
+        status, html = form_post(base, f"/v1/consent/{decl}/sign",
+                                 {"signed_by": "R. Okonkwo",
+                                  "decision": "decline",
+                                  "reason": "our policy needs a named counterparty"})
+        check("a decline is a success", status, 200)
+        check("the page says so", "Declined by R. Okonkwo" in html, True)
+        rows = walls.walls()
+        check("one wall was recorded", len(rows), 1)
+        check("under walls", rows[0]["kind"], "walls")
+        check("clustered, not forced", rows[0]["cluster"],
+              "counterparty-identity")
+        check("the operator's own words are kept", rows[0]["text"],
+              "our policy needs a named counterparty")
+
+        unk = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                   {"X-Buyer-Token": BUYER})[1]["consent_id"]
+        form_post(base, f"/v1/consent/{unk}/sign",
+                  {"signed_by": "R", "decision": "decline",
+                   "reason": "we built this in house last quarter"})
+        check("an unmatched reason goes to unclustered",
+              walls.walls()[-1]["cluster"], "unclustered")
+
+        print("\n9. test_decline_without_reason_is_rejected")
+        nor = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                   {"X-Buyer-Token": BUYER})[1]["consent_id"]
+        before = len(walls.walls())
+        status, body = form_post(base, f"/v1/consent/{nor}/sign",
+                                 {"signed_by": "R", "decision": "decline",
+                                  "reason": ""}, accept="application/json")
+        check("blank reason", (status, json.loads(body)["error"]),
+              (400, "reason_required"))
+        check("and nothing was recorded", len(walls.walls()), before)
+
+        # ---- 10: revoke ----------------------------------------------------
+        print("\n10. test_revoke_is_idempotent_and_needs_no_auth")
+        rev = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                   {"X-Buyer-Token": BUYER})[1]["consent_id"]
+        one = call("POST", f"/v1/consent/{rev}/revoke")
+        two = call("POST", f"/v1/consent/{rev}/revoke")
+        check("revoke with no token", (one[0], one[1]["state"]), (200, "revoked"))
+        check("revoke twice", (two[0], two[1]["state"]), (200, "revoked"))
+        check("then a signature is refused",
+              call("POST", f"/v1/consent/{rev}/sign",
+                   {"signed_by": "R", "decision": "approve"})[1]["error"],
+              "invalid_state")
+
+        # ---- 11: a signed page has no form ---------------------------------
+        print("\n11. test_signed_page_shows_no_form")
+        status, html = form_post(base, f"/v1/consent/{csn}/sign",
+                                 {"signed_by": "R. Okonkwo",
+                                  "decision": "approve", "reason": ""})
+        check("approving over a plain HTML form", status, 200)
+        signed = parse_page(raw_get(base, f"/v1/consent/{csn}")[1])
+        check("the signed page carries no form", signed.forms, 0)
+        check("and shows who signed",
+              "Approved by R. Okonkwo" in raw_get(base, f"/v1/consent/{csn}")[1],
+              True)
+
+        # ---- 13: non-custody language and a live receipt --------------------
+        print("\n13. test_no_custody_language_is_present_verbatim")
+        live = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                    {"X-Buyer-Token": BUYER})[1]["consent_id"]
+        html = raw_get(base, f"/v1/consent/{live}")[1]
+        check('"We never hold" is on the page', "We never hold" in html, True)
+        check('"private key" is on the page', "private key" in html, True)
+        receipts = [h for h in parse_page(html).links if "/v1/receipts/" in h]
+        check("a receipt link is on the page", bool(receipts), True)
+        rpath = urllib.parse.urlparse(receipts[0]).path
+        rstatus, rbody, _ = raw_get(base, rpath)
+        check("and it resolves 200 with no auth", rstatus, 200)
+        check("on a confirmed block", json.loads(rbody)["confirmed"], True)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    # ---- 12: demand unavailable is a hard failure ------------------------
+    print("\n12. test_demand_unavailable_is_a_hard_failure")
+    service, node, clock, httpd, call, consents, walls = boot(with_consent=True)
+    base = service.base_url
+    try:
+        settle_one(service, call)
+        csn = call("POST", "/v1/consent", {"agent": "DeskCrew"},
+                   {"X-Buyer-Token": BUYER})[1]["consent_id"]
+        check("the page renders while the queue is readable",
+              raw_get(base, f"/v1/consent/{csn}")[0], 200)
+
+        class Unreachable(DemandSource):
+            def snapshot(self):
+                raise DemandUnavailable("queue is not answering")
+
+        consents.demand = Unreachable(service)
+        status, html, _ = raw_get(base, f"/v1/consent/{csn}")
+        parsed = parse_page(html)
+        check("unreadable queue -> status", status, 503)
+        check("and no form came back", (parsed.forms, parsed.buttons), (0, []))
+        check("a signature is refused too",
+              call("POST", f"/v1/consent/{csn}/sign",
+                   {"signed_by": "R", "decision": "approve"})[1]["error"],
+              "demand_unavailable")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 if __name__ == "__main__":

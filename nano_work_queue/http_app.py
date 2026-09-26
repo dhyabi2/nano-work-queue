@@ -11,12 +11,13 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import errors, store
+from . import consent_page, errors, store
 from .service import MAX_BODY_BYTES, Service
 
 RATE_LIMIT_PER_MIN = 30
 
 _JOB = r"(?P<job_id>job_[0-9a-f]{16})"
+_CSN = r"(?P<consent_id>csn_[0-9a-f]{16})"
 
 
 class RateLimiter:
@@ -38,7 +39,7 @@ class RateLimiter:
 
 
 def make_handler(service, buyer_token_getter=store.env_buyer_token,
-                 rate_limiter=None):
+                 rate_limiter=None, consents=None):
     limiter = rate_limiter or RateLimiter(service.clock)
 
     routes = [
@@ -53,6 +54,14 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
         ("POST", re.compile(rf"^/v1/jobs/{_JOB}/reject$"), "reject"),
         ("POST", re.compile(rf"^/v1/jobs/{_JOB}/close$"), "close"),
         ("GET", re.compile(rf"^/v1/receipts/{_JOB}$"), "receipt"),
+        # The consent page. Public and unauthenticated except for create:
+        # an operator who has to hold a token to read what they are being
+        # asked to sign will not read it.
+        ("GET", re.compile(rf"^/v1/consent/{_CSN}\.json$"), "consent_json"),
+        ("GET", re.compile(rf"^/v1/consent/{_CSN}$"), "consent_page"),
+        ("POST", re.compile(rf"^/v1/consent/{_CSN}/sign$"), "consent_sign"),
+        ("POST", re.compile(rf"^/v1/consent/{_CSN}/revoke$"), "consent_revoke"),
+        ("POST", re.compile(r"^/v1/consent$"), "consent_create"),
     ]
 
     class Handler(BaseHTTPRequestHandler):
@@ -80,6 +89,11 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
         def _error(self, exc):
             self._send(exc.status, exc.body())
 
+        def _error_html(self, exc):
+            """The same status and code, rendered as a page with no form on it."""
+            self._send(exc.status, consent_page.render_error(exc),
+                       content_type="text/html; charset=utf-8")
+
         def _body(self):
             length = self.headers.get("Content-Length")
             try:
@@ -93,6 +107,15 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
             raw = self.rfile.read(n)
             if len(raw) > MAX_BODY_BYTES:
                 raise errors.payload_too_large()
+            content_type = (self.headers.get("Content-Type") or "").lower()
+            if content_type.startswith("application/x-www-form-urlencoded"):
+                # The consent page posts a plain HTML form: it has to work
+                # with JavaScript disabled, so it cannot send JSON.
+                try:
+                    fields = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+                except UnicodeDecodeError:
+                    raise errors.bad_request("Body is not valid UTF-8.") from None
+                return {k: v[-1] for k, v in fields.items()}
             try:
                 parsed = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -206,7 +229,75 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
             else:
                 self._send(200, service.receipt(job_id))
 
+        # -- consent -----------------------------------------------------
+        def _consents(self):
+            if consents is None:
+                raise errors.not_found("route")
+            return consents
+
+        def _wants_json(self):
+            return "application/json" in (
+                self.headers.get("Accept") or "").lower()
+
+        def _do_consent_page(self, m, q):
+            self._public()
+            svc = self._consents()
+            try:
+                consent, demand = svc.view(m.group("consent_id"))
+            except errors.ApiError as exc:
+                if self._wants_json():
+                    raise
+                # 409 no_demand_yet and 503 demand_unavailable both land here.
+                # The status is the same either way; what matters is that the
+                # body that comes back carries no form.
+                self._error_html(exc)
+                return
+            if self._wants_json():
+                self._send(200, svc.as_json(consent, demand=_demand_summary(demand)))
+                return
+            self._send(200, consent_page.render(consent, demand, svc.base_url),
+                       content_type="text/html; charset=utf-8")
+
+        def _do_consent_json(self, m, q):
+            self._public()
+            svc = self._consents()
+            consent, demand = svc.view(m.group("consent_id"))
+            self._send(200, svc.as_json(consent, demand=_demand_summary(demand)))
+
+        def _do_consent_sign(self, m, q):
+            self._public()
+            svc = self._consents()
+            body = self._body()
+            result = svc.sign(m.group("consent_id"), body)
+            if self._wants_json() or not _is_form_post(self):
+                self._send(200, result)
+                return
+            # A browser posted the form, so answer with the page it should now
+            # see rather than a JSON body it cannot read.
+            consent, demand = svc.view(m.group("consent_id"))
+            self._send(200, consent_page.render(consent, demand, svc.base_url),
+                       content_type="text/html; charset=utf-8")
+
+        def _do_consent_revoke(self, m, q):
+            self._public()
+            self._send(200, self._consents().revoke(m.group("consent_id")))
+
+        def _do_consent_create(self, m, q):
+            self._need_buyer()
+            self._send(201, self._consents().create(self._body()))
+
     return Handler
+
+
+def _is_form_post(handler):
+    return (handler.headers.get("Content-Type") or "").lower().startswith(
+        "application/x-www-form-urlencoded")
+
+
+def _demand_summary(demand):
+    return {"settled": demand["settled"],
+            "paid_xno_total": demand["paid_xno_total"],
+            "open": demand["open"]}
 
 
 def serve(service, host="127.0.0.1", port=8080, **kw):
@@ -239,10 +330,25 @@ def main(argv=None):  # pragma: no cover - entry point
             "implementation, or pass --fake-node for local development."
         )
 
-    service = Service(FakeNode(), clock=Clock(),
-                      base_url=f"http://{args.host}:{args.port}")
+    base_url = os.environ.get("DEMAND_QUEUE_PUBLIC_BASE_URL",
+                              f"http://{args.host}:{args.port}")
+    service = Service(FakeNode(), clock=Clock(), base_url=base_url)
+
+    # The consent page is served by this same service, per
+    # specs/unstuck/agent-tool-operator-consent-page.md: it has to read the
+    # queue's totals live at render time, and an operator page that pointed at
+    # a second deployment could show figures the queue no longer has.
+    from .consent import ConsentService, DemandSource
+    from .conversations import FileConversationStore, MemoryConversationStore
+
+    walls_path = os.environ.get("DEMAND_QUEUE_WALLS_PATH")
+    consents = ConsentService(
+        DemandSource(service), service.clock, base_url=base_url,
+        conversation_store=(FileConversationStore(walls_path) if walls_path
+                            else MemoryConversationStore()))
+
     worker_stop = _start_worker(service)
-    httpd = serve(service, args.host, args.port)
+    httpd = serve(service, args.host, args.port, consents=consents)
     print(f"listening on http://{args.host}:{args.port}/v1/health")
     try:
         httpd.serve_forever()
