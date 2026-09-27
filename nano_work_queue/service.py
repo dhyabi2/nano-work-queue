@@ -251,12 +251,28 @@ class Service:
         self.store.reap_expired_claims()
         jobs = sorted(
             (j for j in self.store.all_jobs() if state is None or j.state == state),
-            key=lambda j: (j.created_at, j.id),
+            key=_page_key,
         )
         start = 0
         if cursor:
-            ids = [j.id for j in jobs]
-            start = ids.index(cursor) + 1 if cursor in ids else 0
+            # The cursor is resolved against the whole store, not against this
+            # page's filtered list. The filter is `state`, and this queue moves
+            # jobs across states constantly -- a claim, a reap, a reject -- so
+            # the job a cursor names has usually left `state=open` by the time
+            # the next page is asked for. Looking the cursor up in the filtered
+            # list made that a silent `start = 0`: page two came back as page
+            # one, and a seller paging the queue re-read jobs it had already
+            # seen instead of advancing.
+            anchor = self.store.get(cursor)
+            if anchor is None:
+                raise errors.bad_request(
+                    "cursor must be the next_cursor of an earlier page.",
+                    field="cursor",
+                )
+            after = _page_key(anchor)
+            # `jobs` is sorted, so this is the index just past the anchor
+            # whether or not the anchor itself survived the filter.
+            start = sum(1 for j in jobs if _page_key(j) <= after)
         window = jobs[start : start + limit]
         nxt = window[-1].id if len(jobs) > start + limit and window else None
         return {
@@ -375,6 +391,11 @@ class Service:
                 ):
                     raise errors.forbidden()
             raise errors.unauthorized()
+
+
+def _page_key(job):
+    """The listing's sort key, and therefore its pagination key."""
+    return (job.created_at, job.id)
 
 
 def _require_str(body, field, lo, hi):

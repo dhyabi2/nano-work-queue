@@ -484,6 +484,58 @@ class ErrorPaths(unittest.TestCase):
             {j["id"] for j in first["jobs"] + second["jobs"]}, set(ids)
         )
 
+    def test_pagination_advances_when_the_cursor_job_leaves_the_filter(self):
+        """A claim on the job a cursor names must not restart the listing.
+
+        `state=open` is the default listing and this queue moves jobs out of
+        `open` constantly, so the cursor's own job is usually gone by the time
+        the next page is asked for. Resolving the cursor inside the filtered
+        list made that a silent restart: page two came back as page one.
+        """
+        service, _n, _c = build()
+        for _ in range(5):
+            post(service)
+        # The listing sorts by (created_at, id), and the fake clock stamps
+        # these in the same instant, so take the order from the service.
+        ids = [j.id for j in sorted(service.store.all_jobs(),
+                                    key=lambda j: (j.created_at, j.id))]
+
+        first = service.list_jobs(state=store.OPEN, limit=2)
+        cursor = first["next_cursor"]
+        self.assertIsNotNone(cursor)
+
+        # A seller claims exactly the job the cursor points at.
+        service.claim(cursor, {"seller": "a", "payout_address": GOOD_ADDRESS})
+        self.assertEqual(service.store.get(cursor).state, store.CLAIMED)
+
+        second = service.list_jobs(state=store.OPEN, limit=2, cursor=cursor)
+        seen_first = [j["id"] for j in first["jobs"]]
+        seen_second = [j["id"] for j in second["jobs"]]
+
+        self.assertEqual(seen_second, ids[2:4])
+        self.assertEqual(set(seen_first) & set(seen_second), set())
+
+        # And the whole listing is still walkable to the end with no repeats.
+        walked, cur = [], None
+        while True:
+            page = service.list_jobs(state=store.OPEN, limit=2, cursor=cur)
+            walked += [j["id"] for j in page["jobs"]]
+            cur = page["next_cursor"]
+            if cur is None:
+                break
+            self.assertLessEqual(len(walked), len(ids))
+        self.assertEqual(len(walked), len(set(walked)))
+
+    def test_pagination_refuses_a_cursor_that_names_no_job(self):
+        """An unknown cursor is a 400, not a silent restart from the top."""
+        service, _n, _c = build()
+        for _ in range(3):
+            post(service)
+        with self.assertRaises(errors.ApiError) as ctx:
+            service.list_jobs(limit=2, cursor="job_0000000000000000")
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.code, "bad_request")
+
     def test_job_detail_never_exposes_the_payout_address(self):
         service, _n, _c = build()
         job = post(service)
