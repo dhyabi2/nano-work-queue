@@ -23,8 +23,8 @@ Python 3.10+ and the standard library. No dependencies.
 
 ```bash
 git clone <this repo> && cd nano-work-queue
-python3 -m unittest discover -s tests -t tests   # 42 tests
-python3 e2e_check.py                             # 44 end-to-end checks
+python3 -m unittest discover -s tests -t tests   # 104 tests
+python3 e2e_check.py                             # 95 end-to-end checks
 ```
 
 To run the service locally against the in-process fake node:
@@ -244,7 +244,7 @@ an operator can actually reach.
 ## Tests
 
 ```
-python3 -m unittest discover -s tests -t tests   # 99 tests
+python3 -m unittest discover -s tests -t tests   # 104 tests
 python3 e2e_check.py                             # 95 checks over real HTTP
 ```
 
