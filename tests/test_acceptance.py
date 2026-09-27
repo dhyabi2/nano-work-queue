@@ -426,6 +426,52 @@ class ErrorPaths(unittest.TestCase):
         self.assertEqual(one_raw, 1)
         self.assertEqual(amounts.format_xno(1), "0." + "0" * 29 + "1")
 
+    def test_amounts_do_not_round_at_the_decimal_context_precision(self):
+        """An exact XNO amount can need 31 significant digits; 28 is not enough.
+
+        Scaling with ``Decimal.scaleb`` ran under the default 28-digit
+        context and rounded anything longer to fit, so these amounts came
+        back as a different amount than was sent. Every case below is inside
+        the accepted price range, so none of them was caught by a range check.
+        """
+        one_over_one_xno = "1." + "0" * 29 + "1"          # 10**30 + 1 raw
+        self.assertEqual(
+            amounts.parse_xno(one_over_one_xno), amounts.RAW_PER_XNO + 1
+        )
+        # The worst shape: rounding *up*, so the rail reads a larger amount
+        # than the caller wrote - here all the way to a round 100 XNO.
+        just_under_100 = "99." + "9" * 30
+        self.assertEqual(
+            amounts.parse_xno(just_under_100), 100 * amounts.RAW_PER_XNO - 1
+        )
+        self.assertLess(
+            amounts.parse_xno(just_under_100), 100 * amounts.RAW_PER_XNO
+        )
+        self.assertEqual(
+            amounts.parse_xno("12.345678901234567890123456789012"),
+            12345678901234567890123456789012,
+        )
+
+    def test_amounts_round_trip_at_full_precision(self):
+        """format_xno then parse_xno returns the same raw, to the last digit."""
+        for raw in (
+            amounts.RAW_PER_XNO + 1,
+            amounts.RAW_PER_XNO + 10**24 + 7,
+            42 * amounts.RAW_PER_XNO + 123456789012345678901234567890,
+            100 * amounts.RAW_PER_XNO - 1,
+            1,
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(amounts.parse_xno(amounts.format_xno(raw)), raw)
+
+    def test_amounts_still_refuse_what_is_not_a_decimal_string(self):
+        """The exact scaling must not have widened what parse_xno accepts."""
+        for bad in (".", "", "   ", "+1", "-1", "1e3", "Inf", "NaN", "1.2.3",
+                    "0x10", "1 000", None, 1, True, 1.0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(amounts.AmountError):
+                    amounts.parse_xno(bad)
+
     def test_listing_paginates_and_reports_totals(self):
         service, _n, _c = build()
         ids = [post(service)["id"] for _ in range(3)]

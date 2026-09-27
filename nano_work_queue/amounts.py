@@ -41,7 +41,15 @@ def parse_xno(text) -> int:
     exponent = d.as_tuple().exponent
     if exponent < -MAX_DP:
         raise AmountError(f"amount has more than {MAX_DP} decimal places: {text!r}")
-    return int(d.scaleb(30))
+    # Scale by shifting the digit strings, not with Decimal arithmetic.
+    # ``d.scaleb(30)`` runs under the default 28-significant-digit context, so
+    # an amount that needs more than 28 digits is silently rounded to fit:
+    # "1.000000000000000000000000000001" came back one raw short, and
+    # "99.999999999999999999999999999999" rounded *up* to a full 100 XNO. That
+    # is the same digit loss a float causes, one layer further in, and it is
+    # why the conversion is integer-only here as it is everywhere else.
+    whole, _, frac = s.partition(".")
+    return int(whole or "0") * RAW_PER_XNO + int(frac.ljust(MAX_DP, "0") or "0")
 
 
 def format_xno(raw: int) -> str:
