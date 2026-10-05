@@ -65,12 +65,33 @@ def payout_address_conflict():
     )
 
 
+# Every message in this module ends with the one thing the caller should do
+# next, because an agent's only recovery path is the text it reads back. The
+# remedy therefore has to match the credential that is missing: `what` was
+# parameterised but the remedy sentence was not, so a buyer whose
+# `X-Buyer-Token` was missing or wrong was told to "send it as
+# 'Authorization: Bearer <claim_token>' from the claim response" - the seller's
+# header, the seller's credential, and a claim response a buyer never has.
+# Following it fails again, and posting work is the first call a buyer makes.
+_REMEDIES = {
+    "claim token": (
+        "Send it as 'Authorization: Bearer <claim_token>' from the claim "
+        "response."
+    ),
+    "buyer token": (
+        "Send it as the 'X-Buyer-Token' header, holding the operator's "
+        "DEMAND_QUEUE_BUYER_TOKEN. A claim token will not do: this is the "
+        "buyer's own credential and no claim response carries it."
+    ),
+}
+
+
 def unauthorized(what="claim token"):
+    remedy = _REMEDIES.get(what, _REMEDIES["claim token"])
     return ApiError(
         401,
         "unauthorized",
-        f"Missing or invalid {what}. Nothing changed. Send it as "
-        "'Authorization: Bearer <claim_token>' from the claim response.",
+        f"Missing or invalid {what}. Nothing changed. {remedy}",
     )
 
 
