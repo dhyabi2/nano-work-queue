@@ -76,6 +76,46 @@ class HttpCase(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(body["price_xno"], "0.050000")
 
+    def test_the_401_tells_a_buyer_which_credential_to_send(self):
+        """The message is a buyer agent's whole recovery path, so it has to name
+        the buyer's own header - not the seller's.
+
+        `errors.unauthorized` parameterised *which* credential was missing but
+        hardcoded the remedy for the claim-token case, so a buyer with no
+        `X-Buyer-Token` was told to "send it as 'Authorization: Bearer
+        <claim_token>' from the claim response": the wrong header, the seller's
+        credential, and a claim response a buyer never has. An agent that
+        follows it fails again, and posting work is the first call a buyer makes.
+        """
+        for headers in (None, {"X-Buyer-Token": "wrong"}):
+            with self.subTest(headers=headers):
+                status, body = self.req("POST", "/v1/jobs", JOB_BODY, headers)
+                self.assertEqual(status, 401)
+                message = body["message"]
+                self.assertIn("buyer token", message)
+                self.assertIn("X-Buyer-Token", message)
+                self.assertIn("DEMAND_QUEUE_BUYER_TOKEN", message)
+                self.assertNotIn(
+                    "Authorization: Bearer <claim_token>", message,
+                    "a buyer is being sent to the seller's header")
+                self.assertNotIn(
+                    "Authorization", message,
+                    "a buyer must not be pointed at the Authorization header")
+                self.assertIn(
+                    "claim token will not do", message,
+                    "the message should pre-empt the swap it used to invite")
+
+    def test_the_401_still_tells_a_seller_to_use_the_claim_token(self):
+        """The other half of the same message: a seller delivering without the
+        `Authorization` header must still get the claim-token remedy, unchanged.
+        """
+        _s, job = self.req("POST", "/v1/jobs", JOB_BODY, self.buyer())
+        status, body = self.req(
+            "POST", f"/v1/jobs/{job['id']}/deliver", {"payload": "x"})
+        self.assertEqual(status, 401)
+        self.assertIn("claim token", body["message"])
+        self.assertIn("Authorization: Bearer <claim_token>", body["message"])
+
     def test_full_cycle_over_http(self):
         _s, job = self.req("POST", "/v1/jobs", JOB_BODY, self.buyer())
         job_id = job["id"]
