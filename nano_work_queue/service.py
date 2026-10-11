@@ -9,6 +9,7 @@ takes money from a seller, and no method that returns 402.
 
 from . import address, amounts, errors, store
 from .clock import Clock
+from .node import NodeError
 from .store import (
     ACCEPTED, CLAIMED, DELIVERED, EXPIRED, OPEN, REJECTED, SETTLED, Store,
 )
@@ -83,7 +84,17 @@ class Service:
                 if j.state in (OPEN, CLAIMED, DELIVERED, ACCEPTED)
             ]
         )
-        available = self.node.balance_raw() - committed
+        # The balance read is the only node call on a request path. A node
+        # that is down has to come back as a refusal with a status on it: an
+        # unhandled exception makes ThreadingHTTPServer close the socket, so
+        # the buyer saw RemoteDisconnected and could not tell whether the job
+        # had been posted. `health()` and the settlement worker already treat
+        # an unreachable node this way; this path did not.
+        try:
+            balance_raw = self.node.balance_raw()
+        except (NodeError, OSError):
+            raise errors.node_unavailable() from None
+        available = balance_raw - committed
         if price_raw > available:
             raise errors.insufficient_funds(amounts.format_xno(max(available, 0)))
 

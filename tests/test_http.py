@@ -284,6 +284,44 @@ class McpSurface(unittest.TestCase):
         self.assertEqual(call(service, "no_such_tool", {})["error"], "not_found")
 
 
+class NodeDownOverHttp(unittest.TestCase):
+    """The buyer must get a status back when the node cannot be read."""
+
+    def setUp(self):
+        from http.server import ThreadingHTTPServer
+
+        self.service, self.node, self.clock = build()
+        self.node.up = False
+        handler = make_handler(
+            self.service,
+            buyer_token_getter=lambda: BUYER,
+            rate_limiter=RateLimiter(self.clock, limit=30),
+        )
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_post_job_answers_503_rather_than_closing_the_socket(self):
+        data = json.dumps(JOB_BODY).encode()
+        r = urllib.request.Request(self.base + "/v1/jobs", data=data,
+                                   method="POST")
+        r.add_header("Content-Type", "application/json")
+        r.add_header("X-Buyer-Token", BUYER)
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                self.fail(f"expected a 503, got {resp.status}")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 503)
+            self.assertEqual(json.loads(exc.read().decode())["error"],
+                             "node_unavailable")
+        # No RemoteDisconnected: the connection carried a response.
+        self.assertEqual(self.service.store.all_jobs(), [])
+
+
 class AgentCard(unittest.TestCase):
     def test_card_has_one_skill_and_a_real_exchange(self):
         from nano_work_queue.a2a import SKILL_ID, agent_card

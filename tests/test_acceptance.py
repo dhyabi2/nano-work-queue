@@ -406,6 +406,26 @@ class ErrorPaths(unittest.TestCase):
         self.assertEqual(service.health()["node"], "unreachable")
         self.assertFalse(service.health()["ok"])
 
+    def test_post_refuses_with_a_status_when_the_node_is_down(self):
+        """A down node must refuse the post, not escape as a NodeError.
+
+        `post_job` reads the balance to refuse work it could not pay for.
+        That read is the only node call on a request path, and an exception
+        escaping it reaches ThreadingHTTPServer, which answers by closing the
+        socket: the buyer gets no status at all and cannot tell whether the
+        job was stored.
+        """
+        service, node, _c = build()
+        node.up = False
+
+        with self.assertRaises(errors.ApiError) as ctx:
+            post(service)
+
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(ctx.exception.code, "node_unavailable")
+        self.assertIn("Nothing was stored", ctx.exception.message)
+        self.assertEqual(service.store.all_jobs(), [])
+
     def test_health_reports_funds_and_backlog(self):
         service, _n, _c = build(balance_xno="2")
         post(service)
