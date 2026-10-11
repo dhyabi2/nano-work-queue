@@ -134,6 +134,16 @@ def insufficient_funds(available: str):
     )
 
 
+def node_unavailable():
+    return ApiError(
+        503,
+        "node_unavailable",
+        "The funded account's balance could not be read, so whether this job "
+        "can be paid is unknown. Nothing was stored. Retry once GET /v1/health "
+        "reports the node reachable.",
+    )
+
+
 def reason_required():
     return ApiError(
         400,
