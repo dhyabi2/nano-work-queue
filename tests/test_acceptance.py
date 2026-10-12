@@ -492,10 +492,24 @@ class ErrorPaths(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "node_unavailable")
         self.assertIs(ctx.exception.__cause__, cause)
         self.assertTrue(
-            any("balance read failed: ValueError: invalid literal" in line
-                for line in service.log_lines),
+            "balance read failed: ValueError" in service.log_lines,
             service.log_lines,
         )
+
+    def test_balance_read_log_line_carries_no_exception_message(self):
+        service, node, _c = build()
+
+        def broken():
+            raise ValueError("http://user:pw@node:7076 bad\rINJECT")
+
+        node.balance_raw = broken
+        with self.assertRaises(errors.ApiError):
+            post(service)
+        logged = "\n".join(service.log_lines)
+        self.assertIn("balance read failed: ValueError", logged)
+        self.assertNotIn("pw@", logged)
+        self.assertNotIn("\r", logged)
+        self.assertNotIn("INJECT", logged)
 
     def test_api_error_from_the_node_adapter_passes_through(self):
         service, node, _c = build()

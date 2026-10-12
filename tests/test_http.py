@@ -20,6 +20,9 @@ from nano_work_queue.http_app import RateLimiter, make_handler
 from nano_work_queue.settlement import SettlementWorker
 
 BUYER = "test-buyer-token"
+# Built at runtime so the literal never appears in a traceback's source line:
+# a test that finds it in stderr must have found the exception's message.
+LEAKY_MESSAGE = "tok " + "clm_" + "SECRET\r\n" + "FAKE " + "LOG LINE"
 
 
 class HttpCase(unittest.TestCase):
@@ -384,6 +387,23 @@ class UnexpectedErrorOverHttp(unittest.TestCase):
         self.assertIn("RuntimeError", logged)
         self.assertIn("boom", logged)
 
+    def test_logged_traceback_carries_no_exception_message(self):
+        def boom():
+            raise RuntimeError(LEAKY_MESSAGE)
+
+        self.service.health = boom
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(self.base + "/v1/health", timeout=10)
+            ctx.exception.read()
+            ctx.exception.close()
+        logged = captured.getvalue()
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("clm_SECRET", logged)
+        self.assertNotIn("FAKE LOG LINE", logged)
+        self.assertNotIn("\r", logged)
+
 
 class FailureAfterHeadersOverHttp(unittest.TestCase):
     """A failure after the status line went out must not add a second one."""
@@ -404,7 +424,7 @@ class FailureAfterHeadersOverHttp(unittest.TestCase):
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", "100")
                 self.end_headers()
-                raise RuntimeError("failed while writing the body")
+                raise RuntimeError(LEAKY_MESSAGE)
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.httpd.server_address[1]
@@ -430,7 +450,12 @@ class FailureAfterHeadersOverHttp(unittest.TestCase):
         self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
         self.assertTrue(data.startswith(b"HTTP/1.1 200 "), data)
         self.assertNotIn(b"internal", data)
-        self.assertIn("failed while writing the body", captured.getvalue())
+        logged = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("_send", logged)
+        self.assertNotIn("clm_SECRET", logged)
+        self.assertNotIn("FAKE LOG LINE", logged)
 
 
 class AgentCard(unittest.TestCase):

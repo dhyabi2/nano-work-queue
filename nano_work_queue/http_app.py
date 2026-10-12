@@ -22,6 +22,21 @@ _JOB = r"(?P<job_id>job_[0-9a-f]{16})"
 _CSN = r"(?P<consent_id>csn_[0-9a-f]{16})"
 
 
+def _log_exception_type_only(exc):
+    """Write the traceback's frames and the exception's type to stderr.
+
+    Frames come from source files, not from request data; the exception's
+    message (and any chained exception's) is never written.
+    """
+    kind = type(exc)
+    sys.stderr.write(
+        "Traceback (most recent call last):\n"
+        + "".join(traceback.format_tb(exc.__traceback__))
+        + f"{kind.__module__}.{kind.__qualname__}\n"
+    )
+    sys.stderr.flush()
+
+
 class RateLimiter:
     """30 requests per minute per address on the public endpoints."""
 
@@ -160,14 +175,17 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
                     self._error(exc)
                 except store.IllegalTransition as exc:
                     self._error(errors.ApiError(409, "invalid_state", str(exc)))
-                except Exception:
+                except Exception as exc:
                     # Anything else would reach ThreadingHTTPServer, which
-                    # closes the socket with no status. Log the traceback on
-                    # stderr (log_message is silenced, so nothing else will)
-                    # and answer 500 with no exception text in the body. If a
-                    # status line already went out, a second response would
-                    # corrupt the stream: close the connection instead.
-                    traceback.print_exc(file=sys.stderr)
+                    # closes the socket with no status. Log the stack frames
+                    # and the exception type on stderr (log_message is
+                    # silenced, so nothing else will) and answer 500 with no
+                    # exception text in the body. The message is left out of
+                    # the log too: it can carry a claim token or CR/LF that
+                    # would forge log lines. If a status line already went
+                    # out, a second response would corrupt the stream: close
+                    # the connection instead.
+                    _log_exception_type_only(exc)
                     if self._response_started:
                         self.close_connection = True
                     else:

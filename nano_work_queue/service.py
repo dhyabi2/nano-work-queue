@@ -112,10 +112,10 @@ class Service:
         except errors.ApiError:
             raise
         except Exception as exc:
-            # Type and a bounded message only: enough to diagnose, and the
-            # node URL or credentials are not part of it.
-            detail = str(exc).replace("\n", " ")[:200]
-            self._log(f"balance read failed: {type(exc).__name__}: {detail}")
+            # The exception type only, never its message: an adapter's
+            # message can carry the node URL with credentials in it, or CR/LF
+            # that would forge log lines. The full error stays on __cause__.
+            self._log(f"balance read failed: {type(exc).__name__}")
             raise errors.node_unavailable() from exc
         available = balance_raw - committed
         if price_raw > available:
