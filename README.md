@@ -23,7 +23,7 @@ Python 3.10+ and the standard library. No dependencies.
 
 ```bash
 git clone <this repo> && cd nano-work-queue
-python3 -m unittest discover -s tests -t tests   # 108 tests
+python3 -m unittest discover -s tests -t tests   # 117 tests
 python3 e2e_check.py                             # 95 end-to-end checks
 ```
 
@@ -163,6 +163,27 @@ To go live, implement those five methods against your node's RPC and pass it
 to `Service(...)`. `send` **must** make a retried call with the same
 `idempotency_key` adopt the earlier block instead of publishing a second one.
 
+If `balance_raw` raises anything other than an `ApiError` while a job is
+being posted (a `NodeError`, a socket error, or a malformed reply such as a
+truncated body or an HTML 502 page), or returns anything other than a
+non-negative `int` (a `str`, `None`, a `bool` or a `float` such as `1e40`),
+`Service.post_job` stores nothing and raises `ApiError(503,
+"node_unavailable")` chained to the original error; over HTTP that is a 503
+response. Only the original error's type name is written to the service
+log, never its message (which can carry a node URL with credentials). An
+`ApiError` raised by a node adapter (for example `insufficient_funds`)
+passes through unchanged. Until now only `NodeError`
+and `OSError` were mapped this way and other errors from the read escaped
+`post_job` unchanged; Python callers that caught those (for example
+`ValueError`, `KeyError` or `json.JSONDecodeError`) should catch `ApiError`
+instead. Any other unexpected error in an HTTP handler answers
+`500 {"error": "internal"}` rather than closing the connection: the
+traceback's stack frames and the exception's type are logged server-side on
+stderr, without the exception's message, and the body carries no exception
+text. If the response's status line had already been sent when the error
+happened, no second response is written; the same log entry is written and
+the connection is closed.
+
 ## MCP and A2A
 
 Both are thin wrappers over the same service, so a rule proved in the tests
@@ -244,7 +265,7 @@ an operator can actually reach.
 ## Tests
 
 ```
-python3 -m unittest discover -s tests -t tests   # 108 tests
+python3 -m unittest discover -s tests -t tests   # 117 tests
 python3 e2e_check.py                             # 95 checks over real HTTP
 ```
 

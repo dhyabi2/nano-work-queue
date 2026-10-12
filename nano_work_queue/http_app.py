@@ -8,6 +8,8 @@ read from the environment and never from a file.
 import hmac
 import json
 import re
+import sys
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -18,6 +20,21 @@ RATE_LIMIT_PER_MIN = 30
 
 _JOB = r"(?P<job_id>job_[0-9a-f]{16})"
 _CSN = r"(?P<consent_id>csn_[0-9a-f]{16})"
+
+
+def _log_exception_type_only(exc):
+    """Write the traceback's frames and the exception's type to stderr.
+
+    Frames come from source files, not from request data; the exception's
+    message (and any chained exception's) is never written.
+    """
+    kind = type(exc)
+    sys.stderr.write(
+        "Traceback (most recent call last):\n"
+        + "".join(traceback.format_tb(exc.__traceback__))
+        + f"{kind.__module__}.{kind.__qualname__}\n"
+    )
+    sys.stderr.flush()
 
 
 class RateLimiter:
@@ -73,6 +90,12 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
             # Never let the default logger echo a URL or header anywhere a
             # claim token could ride along. The service logs what matters.
             return
+
+        def send_response(self, code, message=None):
+            # Remember that a status line has gone out on this request, so
+            # the catch-all in _handle never writes a second one.
+            self._response_started = True
+            super().send_response(code, message)
 
         def _send(self, status, payload, content_type="application/json; charset=utf-8"):
             if isinstance(payload, (dict, list)):
@@ -138,6 +161,7 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
 
         # -- dispatch ----------------------------------------------------
         def _handle(self, method):
+            self._response_started = False
             parsed = urlparse(self.path)
             for verb, pattern, name in routes:
                 if verb != method:
@@ -151,6 +175,21 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
                     self._error(exc)
                 except store.IllegalTransition as exc:
                     self._error(errors.ApiError(409, "invalid_state", str(exc)))
+                except Exception as exc:
+                    # Anything else would reach ThreadingHTTPServer, which
+                    # closes the socket with no status. Log the stack frames
+                    # and the exception type on stderr (log_message is
+                    # silenced, so nothing else will) and answer 500 with no
+                    # exception text in the body. The message is left out of
+                    # the log too: it can carry a claim token or CR/LF that
+                    # would forge log lines. If a status line already went
+                    # out, a second response would corrupt the stream: close
+                    # the connection instead.
+                    _log_exception_type_only(exc)
+                    if self._response_started:
+                        self.close_connection = True
+                    else:
+                        self._send(500, {"error": "internal"})
                 return
             self._error(errors.not_found("route"))
 

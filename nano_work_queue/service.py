@@ -9,7 +9,6 @@ takes money from a seller, and no method that returns 402.
 
 from . import address, amounts, errors, store
 from .clock import Clock
-from .node import NodeError
 from .store import (
     ACCEPTED, CLAIMED, DELIVERED, EXPIRED, OPEN, REJECTED, SETTLED, Store,
 )
@@ -90,10 +89,34 @@ class Service:
         # the buyer saw RemoteDisconnected and could not tell whether the job
         # had been posted. `health()` and the settlement worker already treat
         # an unreachable node this way; this path did not.
+        #
+        # Catch everything, not just NodeError/OSError: a node that answers
+        # badly (a truncated body is http.client.IncompleteRead, an HTML 502
+        # page is json.JSONDecodeError, a reply missing "balance" is KeyError)
+        # closed the socket in exactly the same way. Whatever the cause, the
+        # balance is unknown and nothing has been stored yet.
+        #
+        # An ApiError raised by a node adapter is already a deliberate answer
+        # (for example insufficient_funds); it passes through unchanged. The
+        # reply is also checked: a str, None, bool, float or negative number
+        # is as unknown as no reply, and a float 1e40 would otherwise compare
+        # as an enormous balance and store the job.
         try:
             balance_raw = self.node.balance_raw()
-        except (NodeError, OSError):
-            raise errors.node_unavailable() from None
+            if (not isinstance(balance_raw, int) or isinstance(balance_raw, bool)
+                    or balance_raw < 0):
+                raise TypeError(
+                    "balance_raw returned "
+                    f"{type(balance_raw).__name__}, not a non-negative int"
+                )
+        except errors.ApiError:
+            raise
+        except Exception as exc:
+            # The exception type only, never its message: an adapter's
+            # message can carry the node URL with credentials in it, or CR/LF
+            # that would forge log lines. The full error stays on __cause__.
+            self._log(f"balance read failed: {type(exc).__name__}")
+            raise errors.node_unavailable() from exc
         available = balance_raw - committed
         if price_raw > available:
             raise errors.insufficient_funds(amounts.format_xno(max(available, 0)))

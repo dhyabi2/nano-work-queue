@@ -4,7 +4,10 @@ The server is started on 127.0.0.1 with an ephemeral port and the node is
 still the fake, so nothing leaves the machine and no Nano node is needed.
 """
 
+import contextlib
+import io
 import json
+import socket
 import threading
 import unittest
 import urllib.error
@@ -17,6 +20,9 @@ from nano_work_queue.http_app import RateLimiter, make_handler
 from nano_work_queue.settlement import SettlementWorker
 
 BUYER = "test-buyer-token"
+# Built at runtime so the literal never appears in a traceback's source line:
+# a test that finds it in stderr must have found the exception's message.
+LEAKY_MESSAGE = "tok " + "clm_" + "SECRET\r\n" + "FAKE " + "LOG LINE"
 
 
 class HttpCase(unittest.TestCase):
@@ -320,6 +326,136 @@ class NodeDownOverHttp(unittest.TestCase):
                              "node_unavailable")
         # No RemoteDisconnected: the connection carried a response.
         self.assertEqual(self.service.store.all_jobs(), [])
+
+
+class BadNodeReplyOverHttp(NodeDownOverHttp):
+    """A node that answers with garbage must still produce a status."""
+
+    def setUp(self):
+        super().setUp()
+        self.node.up = True
+
+        def broken():
+            raise json.JSONDecodeError("Expecting value", "<html>502</html>", 0)
+
+        self.node.balance_raw = broken
+
+
+class UnexpectedErrorOverHttp(unittest.TestCase):
+    """A handler bug must answer 500, not drop the connection."""
+
+    SECRET = "clm_deadbeef internal detail /srv/queue.db"
+
+    def setUp(self):
+        from http.server import ThreadingHTTPServer
+
+        self.service, self.node, self.clock = build()
+
+        def boom():
+            raise RuntimeError(self.SECRET)  # the frame name "boom" is asserted
+
+        self.service.health = boom
+        handler = make_handler(
+            self.service,
+            buyer_token_getter=lambda: BUYER,
+            rate_limiter=RateLimiter(self.clock, limit=30),
+        )
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_unexpected_exception_answers_500_without_its_text(self):
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            try:
+                with urllib.request.urlopen(self.base + "/v1/health",
+                                            timeout=10) as resp:
+                    self.fail(f"expected a 500, got {resp.status}")
+            except urllib.error.HTTPError as exc:
+                self.assertEqual(exc.code, 500)
+                raw = exc.read().decode()
+        self.assertEqual(json.loads(raw), {"error": "internal"})
+        self.assertNotIn("deadbeef", raw)
+        self.assertNotIn("RuntimeError", raw)
+        # The body says nothing, so the traceback has to land server-side.
+        logged = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("boom", logged)
+
+    def test_logged_traceback_carries_no_exception_message(self):
+        def boom():
+            raise RuntimeError(LEAKY_MESSAGE)
+
+        self.service.health = boom
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(self.base + "/v1/health", timeout=10)
+            ctx.exception.read()
+            ctx.exception.close()
+        logged = captured.getvalue()
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("clm_SECRET", logged)
+        self.assertNotIn("FAKE LOG LINE", logged)
+        self.assertNotIn("\r", logged)
+
+
+class FailureAfterHeadersOverHttp(unittest.TestCase):
+    """A failure after the status line went out must not add a second one."""
+
+    def setUp(self):
+        from http.server import ThreadingHTTPServer
+
+        self.service, self.node, self.clock = build()
+        base_handler = make_handler(
+            self.service,
+            buyer_token_getter=lambda: BUYER,
+            rate_limiter=RateLimiter(self.clock, limit=30),
+        )
+
+        class Handler(base_handler):
+            def _send(self, status, payload, content_type="application/json"):
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                raise RuntimeError(LEAKY_MESSAGE)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_exactly_one_status_line_and_the_connection_closes(self):
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            with socket.create_connection(("127.0.0.1", self.port),
+                                          timeout=10) as sock:
+                sock.sendall(b"GET /v1/health HTTP/1.1\r\n"
+                             b"Host: localhost\r\n\r\n")
+                data = b""
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break  # the server closed the connection
+                    data += chunk
+        self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
+        self.assertTrue(data.startswith(b"HTTP/1.1 200 "), data)
+        self.assertNotIn(b"internal", data)
+        logged = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("_send", logged)
+        self.assertNotIn("clm_SECRET", logged)
+        self.assertNotIn("FAKE LOG LINE", logged)
 
 
 class AgentCard(unittest.TestCase):
