@@ -9,7 +9,6 @@ takes money from a seller, and no method that returns 402.
 
 from . import address, amounts, errors, store
 from .clock import Clock
-from .node import NodeError
 from .store import (
     ACCEPTED, CLAIMED, DELIVERED, EXPIRED, OPEN, REJECTED, SETTLED, Store,
 )
@@ -90,9 +89,15 @@ class Service:
         # the buyer saw RemoteDisconnected and could not tell whether the job
         # had been posted. `health()` and the settlement worker already treat
         # an unreachable node this way; this path did not.
+        #
+        # Catch everything, not just NodeError/OSError: a node that answers
+        # badly (a truncated body is http.client.IncompleteRead, an HTML 502
+        # page is json.JSONDecodeError, a reply missing "balance" is KeyError)
+        # closed the socket in exactly the same way. Whatever the cause, the
+        # balance is unknown and nothing has been stored yet.
         try:
             balance_raw = self.node.balance_raw()
-        except (NodeError, OSError):
+        except Exception:
             raise errors.node_unavailable() from None
         available = balance_raw - committed
         if price_raw > available:

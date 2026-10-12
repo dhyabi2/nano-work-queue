@@ -23,7 +23,7 @@ Python 3.10+ and the standard library. No dependencies.
 
 ```bash
 git clone <this repo> && cd nano-work-queue
-python3 -m unittest discover -s tests -t tests   # 108 tests
+python3 -m unittest discover -s tests -t tests   # 111 tests
 python3 e2e_check.py                             # 95 end-to-end checks
 ```
 
@@ -163,6 +163,17 @@ To go live, implement those five methods against your node's RPC and pass it
 to `Service(...)`. `send` **must** make a retried call with the same
 `idempotency_key` adopt the earlier block instead of publishing a second one.
 
+If `balance_raw` raises anything at all while a job is being posted (a
+`NodeError`, a socket error, or a malformed reply such as a truncated body or
+an HTML 502 page), `Service.post_job` stores nothing and raises
+`ApiError(503, "node_unavailable")`; over HTTP that is a 503 response. Until
+now only `NodeError` and `OSError` were mapped this way and other errors from
+the read escaped `post_job` unchanged; Python callers that caught those (for
+example `ValueError`, `KeyError` or `json.JSONDecodeError`) should catch
+`ApiError` instead. Any other unexpected error in an HTTP handler
+answers `500 {"error": "internal"}`, with no exception text in the body,
+rather than closing the connection.
+
 ## MCP and A2A
 
 Both are thin wrappers over the same service, so a rule proved in the tests
@@ -244,7 +255,7 @@ an operator can actually reach.
 ## Tests
 
 ```
-python3 -m unittest discover -s tests -t tests   # 108 tests
+python3 -m unittest discover -s tests -t tests   # 111 tests
 python3 e2e_check.py                             # 95 checks over real HTTP
 ```
 

@@ -151,6 +151,11 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
                     self._error(exc)
                 except store.IllegalTransition as exc:
                     self._error(errors.ApiError(409, "invalid_state", str(exc)))
+                except Exception:
+                    # Anything else would reach ThreadingHTTPServer, which
+                    # closes the socket with no status. Answer 500 instead,
+                    # and keep the exception text out of the body.
+                    self._send(500, {"error": "internal"})
                 return
             self._error(errors.not_found("route"))
 

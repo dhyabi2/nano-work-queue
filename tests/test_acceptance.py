@@ -63,9 +63,28 @@ class Numbered(unittest.TestCase):
             service.receipt(job["id"]),
             service.receipt_text(job["id"]),
         ]
+        # Assert on status and error codes, not on a "402" substring: the
+        # surfaces carry random hex ids and block hashes, and "402" turns up
+        # in those by chance (about one run in a few hundred).
+        def walk(value):
+            if isinstance(value, dict):
+                yield value
+                for v in value.values():
+                    yield from walk(v)
+            elif isinstance(value, (list, tuple)):
+                for v in value:
+                    yield from walk(v)
+
+        for obj in walk(seller_surfaces):
+            for key in ("status", "status_code", "http_status"):
+                self.assertNotEqual(obj.get(key), 402,
+                                    f"seller path carries {key}=402: {obj!r}")
+            for key in ("error", "code"):
+                self.assertNotEqual(obj.get(key), "payment_required",
+                                    f"seller path carries {key}=payment_required")
         blob = repr(seller_surfaces).lower()
         for forbidden in ("payment_required", "pay to", "deposit", "escrow",
-                          "x-402", "402"):
+                          "x-402"):
             self.assertNotIn(forbidden, blob, f"seller path mentions {forbidden!r}")
 
         # And no service method is capable of returning a 402 at all.
@@ -425,6 +444,40 @@ class ErrorPaths(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "node_unavailable")
         self.assertIn("Nothing was stored", ctx.exception.message)
         self.assertEqual(service.store.all_jobs(), [])
+
+    def test_post_refuses_with_a_status_when_the_node_answers_badly(self):
+        """A node that answers, but with garbage, is as unknown as a down one.
+
+        A truncated body, an HTML 502 page from a proxy, or a reply without a
+        "balance" field surfaces as ValueError, json.JSONDecodeError, KeyError
+        and the like, not NodeError. Each must still come back as the 503
+        node_unavailable refusal, with nothing stored.
+        """
+        import http.client
+        import json
+
+        failures = [
+            ValueError("invalid literal for int() with base 10: 'abc'"),
+            json.JSONDecodeError("Expecting value", "<html>502</html>", 0),
+            KeyError("balance"),
+            TypeError("'NoneType' object is not subscriptable"),
+            http.client.IncompleteRead(b"{\"bal"),
+        ]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                service, node, _c = build()
+
+                def broken(failure=failure):
+                    raise failure
+
+                node.balance_raw = broken
+                with self.assertRaises(errors.ApiError) as ctx:
+                    post(service)
+
+                self.assertEqual(ctx.exception.status, 503)
+                self.assertEqual(ctx.exception.code, "node_unavailable")
+                self.assertIn("Nothing was stored", ctx.exception.message)
+                self.assertEqual(service.store.all_jobs(), [])
 
     def test_health_reports_funds_and_backlog(self):
         service, _n, _c = build(balance_xno="2")

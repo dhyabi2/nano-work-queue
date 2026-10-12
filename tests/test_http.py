@@ -322,6 +322,59 @@ class NodeDownOverHttp(unittest.TestCase):
         self.assertEqual(self.service.store.all_jobs(), [])
 
 
+class BadNodeReplyOverHttp(NodeDownOverHttp):
+    """A node that answers with garbage must still produce a status."""
+
+    def setUp(self):
+        super().setUp()
+        self.node.up = True
+
+        def broken():
+            raise json.JSONDecodeError("Expecting value", "<html>502</html>", 0)
+
+        self.node.balance_raw = broken
+
+
+class UnexpectedErrorOverHttp(unittest.TestCase):
+    """A handler bug must answer 500, not drop the connection."""
+
+    SECRET = "clm_deadbeef internal detail /srv/queue.db"
+
+    def setUp(self):
+        from http.server import ThreadingHTTPServer
+
+        self.service, self.node, self.clock = build()
+
+        def boom():
+            raise RuntimeError(self.SECRET)
+
+        self.service.health = boom
+        handler = make_handler(
+            self.service,
+            buyer_token_getter=lambda: BUYER,
+            rate_limiter=RateLimiter(self.clock, limit=30),
+        )
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_unexpected_exception_answers_500_without_its_text(self):
+        try:
+            with urllib.request.urlopen(self.base + "/v1/health",
+                                        timeout=10) as resp:
+                self.fail(f"expected a 500, got {resp.status}")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 500)
+            raw = exc.read().decode()
+            self.assertEqual(json.loads(raw), {"error": "internal"})
+            self.assertNotIn("deadbeef", raw)
+            self.assertNotIn("RuntimeError", raw)
+
+
 class AgentCard(unittest.TestCase):
     def test_card_has_one_skill_and_a_real_exchange(self):
         from nano_work_queue.a2a import SKILL_ID, agent_card
