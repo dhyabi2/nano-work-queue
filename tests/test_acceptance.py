@@ -479,6 +479,50 @@ class ErrorPaths(unittest.TestCase):
                 self.assertIn("Nothing was stored", ctx.exception.message)
                 self.assertEqual(service.store.all_jobs(), [])
 
+    def test_balance_read_failure_is_logged_and_chained(self):
+        service, node, _c = build()
+        cause = ValueError("invalid literal for int() with base 10: 'abc'")
+
+        def broken():
+            raise cause
+
+        node.balance_raw = broken
+        with self.assertRaises(errors.ApiError) as ctx:
+            post(service)
+        self.assertEqual(ctx.exception.code, "node_unavailable")
+        self.assertIs(ctx.exception.__cause__, cause)
+        self.assertTrue(
+            any("balance read failed: ValueError: invalid literal" in line
+                for line in service.log_lines),
+            service.log_lines,
+        )
+
+    def test_api_error_from_the_node_adapter_passes_through(self):
+        service, node, _c = build()
+        own = errors.insufficient_funds("0")
+
+        def refuses():
+            raise own
+
+        node.balance_raw = refuses
+        with self.assertRaises(errors.ApiError) as ctx:
+            post(service)
+        self.assertIs(ctx.exception, own)
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.code, "insufficient_funds")
+        self.assertEqual(service.store.all_jobs(), [])
+
+    def test_post_refuses_when_the_balance_is_not_a_non_negative_int(self):
+        for bad in ("123", None, 1e40, 5.0, True, False, -1, [1]):
+            with self.subTest(balance=bad):
+                service, node, _c = build()
+                node.balance_raw = lambda bad=bad: bad
+                with self.assertRaises(errors.ApiError) as ctx:
+                    post(service)
+                self.assertEqual(ctx.exception.status, 503)
+                self.assertEqual(ctx.exception.code, "node_unavailable")
+                self.assertEqual(service.store.all_jobs(), [])
+
     def test_health_reports_funds_and_backlog(self):
         service, _n, _c = build(balance_xno="2")
         post(service)

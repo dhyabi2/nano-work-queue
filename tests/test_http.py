@@ -4,7 +4,10 @@ The server is started on 127.0.0.1 with an ephemeral port and the node is
 still the fake, so nothing leaves the machine and no Nano node is needed.
 """
 
+import contextlib
+import io
 import json
+import socket
 import threading
 import unittest
 import urllib.error
@@ -346,7 +349,7 @@ class UnexpectedErrorOverHttp(unittest.TestCase):
         self.service, self.node, self.clock = build()
 
         def boom():
-            raise RuntimeError(self.SECRET)
+            raise RuntimeError(self.SECRET)  # the frame name "boom" is asserted
 
         self.service.health = boom
         handler = make_handler(
@@ -363,16 +366,71 @@ class UnexpectedErrorOverHttp(unittest.TestCase):
         self.httpd.server_close()
 
     def test_unexpected_exception_answers_500_without_its_text(self):
-        try:
-            with urllib.request.urlopen(self.base + "/v1/health",
-                                        timeout=10) as resp:
-                self.fail(f"expected a 500, got {resp.status}")
-        except urllib.error.HTTPError as exc:
-            self.assertEqual(exc.code, 500)
-            raw = exc.read().decode()
-            self.assertEqual(json.loads(raw), {"error": "internal"})
-            self.assertNotIn("deadbeef", raw)
-            self.assertNotIn("RuntimeError", raw)
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            try:
+                with urllib.request.urlopen(self.base + "/v1/health",
+                                            timeout=10) as resp:
+                    self.fail(f"expected a 500, got {resp.status}")
+            except urllib.error.HTTPError as exc:
+                self.assertEqual(exc.code, 500)
+                raw = exc.read().decode()
+        self.assertEqual(json.loads(raw), {"error": "internal"})
+        self.assertNotIn("deadbeef", raw)
+        self.assertNotIn("RuntimeError", raw)
+        # The body says nothing, so the traceback has to land server-side.
+        logged = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("boom", logged)
+
+
+class FailureAfterHeadersOverHttp(unittest.TestCase):
+    """A failure after the status line went out must not add a second one."""
+
+    def setUp(self):
+        from http.server import ThreadingHTTPServer
+
+        self.service, self.node, self.clock = build()
+        base_handler = make_handler(
+            self.service,
+            buyer_token_getter=lambda: BUYER,
+            rate_limiter=RateLimiter(self.clock, limit=30),
+        )
+
+        class Handler(base_handler):
+            def _send(self, status, payload, content_type="application/json"):
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                raise RuntimeError("failed while writing the body")
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_exactly_one_status_line_and_the_connection_closes(self):
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            with socket.create_connection(("127.0.0.1", self.port),
+                                          timeout=10) as sock:
+                sock.sendall(b"GET /v1/health HTTP/1.1\r\n"
+                             b"Host: localhost\r\n\r\n")
+                data = b""
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break  # the server closed the connection
+                    data += chunk
+        self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
+        self.assertTrue(data.startswith(b"HTTP/1.1 200 "), data)
+        self.assertNotIn(b"internal", data)
+        self.assertIn("failed while writing the body", captured.getvalue())
 
 
 class AgentCard(unittest.TestCase):

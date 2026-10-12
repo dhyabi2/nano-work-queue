@@ -95,10 +95,28 @@ class Service:
         # page is json.JSONDecodeError, a reply missing "balance" is KeyError)
         # closed the socket in exactly the same way. Whatever the cause, the
         # balance is unknown and nothing has been stored yet.
+        #
+        # An ApiError raised by a node adapter is already a deliberate answer
+        # (for example insufficient_funds); it passes through unchanged. The
+        # reply is also checked: a str, None, bool, float or negative number
+        # is as unknown as no reply, and a float 1e40 would otherwise compare
+        # as an enormous balance and store the job.
         try:
             balance_raw = self.node.balance_raw()
-        except Exception:
-            raise errors.node_unavailable() from None
+            if (not isinstance(balance_raw, int) or isinstance(balance_raw, bool)
+                    or balance_raw < 0):
+                raise TypeError(
+                    "balance_raw returned "
+                    f"{type(balance_raw).__name__}, not a non-negative int"
+                )
+        except errors.ApiError:
+            raise
+        except Exception as exc:
+            # Type and a bounded message only: enough to diagnose, and the
+            # node URL or credentials are not part of it.
+            detail = str(exc).replace("\n", " ")[:200]
+            self._log(f"balance read failed: {type(exc).__name__}: {detail}")
+            raise errors.node_unavailable() from exc
         available = balance_raw - committed
         if price_raw > available:
             raise errors.insufficient_funds(amounts.format_xno(max(available, 0)))

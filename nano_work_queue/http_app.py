@@ -8,6 +8,8 @@ read from the environment and never from a file.
 import hmac
 import json
 import re
+import sys
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -74,6 +76,12 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
             # claim token could ride along. The service logs what matters.
             return
 
+        def send_response(self, code, message=None):
+            # Remember that a status line has gone out on this request, so
+            # the catch-all in _handle never writes a second one.
+            self._response_started = True
+            super().send_response(code, message)
+
         def _send(self, status, payload, content_type="application/json; charset=utf-8"):
             if isinstance(payload, (dict, list)):
                 raw = json.dumps(payload, indent=1).encode("utf-8")
@@ -138,6 +146,7 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
 
         # -- dispatch ----------------------------------------------------
         def _handle(self, method):
+            self._response_started = False
             parsed = urlparse(self.path)
             for verb, pattern, name in routes:
                 if verb != method:
@@ -153,9 +162,16 @@ def make_handler(service, buyer_token_getter=store.env_buyer_token,
                     self._error(errors.ApiError(409, "invalid_state", str(exc)))
                 except Exception:
                     # Anything else would reach ThreadingHTTPServer, which
-                    # closes the socket with no status. Answer 500 instead,
-                    # and keep the exception text out of the body.
-                    self._send(500, {"error": "internal"})
+                    # closes the socket with no status. Log the traceback on
+                    # stderr (log_message is silenced, so nothing else will)
+                    # and answer 500 with no exception text in the body. If a
+                    # status line already went out, a second response would
+                    # corrupt the stream: close the connection instead.
+                    traceback.print_exc(file=sys.stderr)
+                    if self._response_started:
+                        self.close_connection = True
+                    else:
+                        self._send(500, {"error": "internal"})
                 return
             self._error(errors.not_found("route"))
 
